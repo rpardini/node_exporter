@@ -1,0 +1,134 @@
+---
+# LOCAL-ONLY workflow -- do NOT submit upstream.
+#
+# Builds multi-arch (linux/amd64 + linux/arm64) *distroless* test OCI images and
+# pushes them to ghcr.io under this fork's owner. The image is equivalent to the
+# upstream `-distroless` variant: it is built from the repo's Dockerfile.distroless
+# (base gcr.io/distroless/static-debian13:nonroot, ships LICENSE + NOTICE, carries
+# the io.prometheus.image.variant=distroless label).
+#
+# The image is tagged with an explicit fork version (IMAGE_VERSION below, e.g.
+# 1.12.0-rpardini1); bump that single value for each new build. That version is
+# also stamped into the binary (node_exporter --version).
+#
+# Uses only the automatic GITHUB_TOKEN, so it requires ZERO configured secrets.
+# Intended for testing the rockchip collector on Rockchip (arm64) hardware.
+name: Build test images (ghcr.io)
+
+on:
+  push:
+    branches: [rockchip-collector]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ghcr-test-images-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/node_exporter
+  # Explicit fork image version -- bump for each build
+  IMAGE_VERSION: 1.12.1-rpardini2-distroless
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.x
+
+      - name: Build linux/${{ matrix.arch }} binary
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          pkg="github.com/prometheus/common/version"
+          ldflags="-X ${pkg}.Version=${IMAGE_VERSION} \
+            -X ${pkg}.Revision=${GITHUB_SHA} \
+            -X ${pkg}.Branch=${GITHUB_REF_NAME} \
+            -X ${pkg}.BuildUser=github-actions \
+            -X ${pkg}.BuildDate=$(date -u +%Y%m%d-%H:%M:%S)"
+          go build -ldflags "${ldflags}" -o ".build/linux-${GOARCH}/node_exporter" .
+          ls -la ".build/linux-${GOARCH}/"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.distroless
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            OS=linux
+            ARCH=${{ matrix.arch }}
+            DISTROLESS_ARCH=${{ matrix.arch }}
+          provenance: false
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          retention-days: 1
+          if-no-files-found: error
+
+  merge:
+    name: Merge into multi-arch manifest
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}:${IMAGE_VERSION}" \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${IMAGE_VERSION}"
