@@ -62,7 +62,7 @@ type rockchipCollector struct {
 }
 
 func init() {
-	registerCollector("rockchip", defaultDisabled, NewRockchipCollector)
+	registerCollector("rockchip", defaultEnabled, NewRockchipCollector)
 }
 
 // NewRockchipCollector returns a new Collector exposing Rockchip vendor-kernel
