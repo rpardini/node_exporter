@@ -213,6 +213,7 @@ pcidevice | Exposes pci devices' information including their link status and par
 perf | Exposes perf based metrics (Warning: Metrics are dependent on kernel configuration and settings). | Linux
 processes | Exposes aggregate process statistics from `/proc`. | Linux
 qdisc | Exposes [queuing discipline](https://en.wikipedia.org/wiki/Network_scheduler#Linux_kernel) statistics | Linux
+rockchip | Exposes Rockchip vendor-kernel NPU (`rknpu`) and media (`rkmpp`) accelerator load from `/sys/kernel/debug/rknpu/load` and `/proc/mpp_service/load`. | Linux
 slabinfo | Exposes slab statistics from `/proc/slabinfo`. Note that permission of `/proc/slabinfo` is usually 0400, so set it appropriately. | Linux
 softirqs | Exposes detailed softirq statistics from `/proc/softirqs`. | Linux
 sysctl | Expose sysctl values from `/proc/sys`. Use `--collector.sysctl.include(-info)` to configure. | Linux
@@ -269,6 +270,73 @@ counts when using the `--collector.perf.tracepoint` flag. Tracepoints can be
 found using [`perf list`](http://man7.org/linux/man-pages/man1/perf.1.html) or
 from debugfs. And example usage of this would be
 `--collector.perf.tracepoint="sched:sched_process_exec"`.
+
+### Rockchip Collector
+
+The `rockchip` collector exposes hardware-accelerator load that is only available
+on the Rockchip *vendor* kernel (e.g. `6.1.x-vendor-rk35xx` on RK3568/RK3576/RK3588
+boards); these interfaces do not exist in mainline. It is a no-op on any other
+system. It exposes:
+
+- NPU per-core load (`node_rknpu_load_ratio`) from `/sys/kernel/debug/rknpu/load`.
+- Media (encode/decode/JPEG/IEP) per-device load and utilization
+  (`node_rkmpp_load_ratio`, `node_rkmpp_utilization_ratio`) from
+  `/proc/mpp_service/load`.
+
+The media load file only produces data once a non-zero sampling interval (in
+milliseconds) has been written to `/proc/mpp_service/load_interval`. When enabled,
+the collector writes this once at startup (and re-attempts on each scrape) *only if
+it is currently unset*, using `--collector.rockchip.mpp-load-interval` (default `1s`;
+set to `0` to never write).
+
+Reading the NPU load from debugfs (`/sys/kernel/debug/rknpu/load`, typically mode
+`0700` owned by root) and writing `/proc/mpp_service/load_interval` mean this
+collector generally requires `node_exporter` to be run as **root** (in containers the
+debugfs mount must also be exposed). This is one of the reasons it is disabled by
+default.
+
+> **Note (containers/Kubernetes): the collector cannot prime `load_interval` itself.**
+> Deployments that pass `--path.procfs=/host/proc` (e.g. the
+> [`prometheus-node-exporter`](https://github.com/prometheus-community/helm-charts/tree/main/charts/prometheus-node-exporter)
+> Helm chart used by kube-prometheus-stack) bind-mount the host `/proc`
+> **read-only**, so the collector's write to `load_interval` fails silently (visible
+> only with `--log.level=debug`). Reads still work, so `node_rkmpp_*` metrics simply
+> stay absent until the interval is set by something else. Prime it out-of-band with
+> a small init container that mounts the pod's existing `proc` volume read-write and
+> writes the interval only if the file exists:
+>
+> ```yaml
+> prometheus-node-exporter:
+>   image: { registry: ghcr.io, repository: rpardini/node_exporter, tag: 1.12.0-rpardini1, distroless: true }
+>   extraArgs: [ "--collector.rockchip" ]
+>   # debugfs is needed for rknpu load; runs as root
+>   extraHostVolumeMounts:
+>     - { name: debugfs, hostPath: /sys/kernel/debug, mountPath: /host/sys/kernel/debug, readOnly: true, mountPropagation: HostToContainer }
+>   containerSecurityContext: { runAsUser: 0, runAsNonRoot: false }
+>   # Prime /proc/mpp_service/load_interval on the host (rw) before the exporter starts.
+>   # The exporter's own /host/proc mount is read-only, so it cannot do this itself.
+>   extraInitContainers:
+>     - name: rkmpp-prime-load-interval
+>       image: busybox:1.37
+>       securityContext: { runAsUser: 0, runAsNonRoot: false }
+>       command:
+>         - /bin/sh
+>         - -c
+>         - |
+>           f=/host/proc/mpp_service/load_interval
+>           if [ -e "$f" ]; then
+>             echo 1000 > "$f" && echo "primed $f=1000ms" || echo "WARN: failed to write $f" >&2
+>           else
+>             echo "no mpp_service on this node; skipping"
+>           fi
+>       volumeMounts:
+>         - { name: proc, mountPath: /host/proc, readOnly: false }  # reuse the chart's hostPath:/proc volume, rw
+> ```
+>
+> This re-primes on every pod start, so it recovers after a node reboot (which resets
+> `load_interval` to `0`). The `[ -e "$f" ]` guard makes it a safe no-op on
+> non-Rockchip nodes in a mixed cluster. Keep the init container's interval (`1000`ms)
+> in sync with `--collector.rockchip.mpp-load-interval`.
 
 ### Sysctl Collector
 

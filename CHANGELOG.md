@@ -1,5 +1,7 @@
 ## master / unreleased
 
+* [FEATURE] rockchip: Add collector for Rockchip vendor-kernel NPU/MPP accelerator load #3738
+
 ## 1.12.1 / 2026-07-14
 
 * [BUGFIX] perf: Fix perf profiler flag handling #3731
