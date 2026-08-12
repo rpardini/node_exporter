@@ -7,9 +7,16 @@
 # (base gcr.io/distroless/static-debian13:nonroot, ships LICENSE + NOTICE, carries
 # the io.prometheus.image.variant=distroless label).
 #
-# The image is tagged with an explicit fork version (IMAGE_VERSION below, e.g.
+# It also publishes the linux/amd64 + linux/arm64 binaries as .tar.gz's on a
+# GitHub release, laid out exactly like upstream's promu-built tarballs:
+#   node_exporter-<version>.linux-<arch>.tar.gz
+#     └── node_exporter-<version>.linux-<arch>/{node_exporter,LICENSE,NOTICE}
+# plus a sha256sums.txt covering them.
+#
+# Everything is keyed off an explicit fork version (FORK_VERSION below, e.g.
 # 1.12.0-rpardini1); bump that single value for each new build. That version is
-# also stamped into the binary (node_exporter --version).
+# stamped into the binary (node_exporter --version), used for the release tag
+# (v<FORK_VERSION>) and, with a -distroless suffix, for the image tag.
 #
 # Uses only the automatic GITHUB_TOKEN, so it requires ZERO configured secrets.
 # Intended for testing the rockchip collector on Rockchip (arm64) hardware.
@@ -30,8 +37,8 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/node_exporter
-  # Explicit fork image version -- bump for each build
-  IMAGE_VERSION: 1.12.1-rpardini2-distroless
+  # Explicit fork version -- bump this single value for each build
+  FORK_VERSION: 1.12.1-rpardini2
 
 jobs:
   build:
@@ -58,13 +65,33 @@ jobs:
         run: |
           set -euo pipefail
           pkg="github.com/prometheus/common/version"
-          ldflags="-X ${pkg}.Version=${IMAGE_VERSION} \
+          ldflags="-X ${pkg}.Version=${FORK_VERSION} \
             -X ${pkg}.Revision=${GITHUB_SHA} \
             -X ${pkg}.Branch=${GITHUB_REF_NAME} \
             -X ${pkg}.BuildUser=github-actions \
             -X ${pkg}.BuildDate=$(date -u +%Y%m%d-%H:%M:%S)"
           go build -ldflags "${ldflags}" -o ".build/linux-${GOARCH}/node_exporter" .
           ls -la ".build/linux-${GOARCH}/"
+
+      # Same layout as upstream's promu-built tarballs: a single top-level
+      # directory named after the tarball, holding the binary + LICENSE + NOTICE.
+      - name: Build linux/${{ matrix.arch }} release tarball
+        env:
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          name="node_exporter-${FORK_VERSION}.linux-${GOARCH}"
+          mkdir -p "dist/${name}"
+          cp ".build/linux-${GOARCH}/node_exporter" LICENSE NOTICE "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          tar -tzvf "dist/${name}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          retention-days: 1
+          if-no-files-found: error
 
       - uses: docker/setup-buildx-action@v3
 
@@ -126,9 +153,60 @@ jobs:
         working-directory: ${{ runner.temp }}/digests
         run: |
           docker buildx imagetools create \
-            -t "${IMAGE}:${IMAGE_VERSION}" \
+            -t "${IMAGE}:${FORK_VERSION}-distroless" \
             $(printf '${{ env.IMAGE }}@sha256:%s ' *)
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect "${IMAGE}:${IMAGE_VERSION}"
+          docker buildx imagetools inspect "${IMAGE}:${FORK_VERSION}-distroless"
+
+  release:
+    name: Publish binaries to GitHub release
+    runs-on: ubuntu-latest
+    needs: [build]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: tarball-*
+          merge-multiple: true
+
+      - name: Generate sha256sums.txt
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum *.tar.gz | tee sha256sums.txt
+
+      # Idempotent: re-running for the same FORK_VERSION replaces the assets
+      # rather than failing on an existing release.
+      - name: Create or update release v${{ env.FORK_VERSION }}
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="v${FORK_VERSION}"
+
+          cat >notes.md <<EOF
+          Fork build of node_exporter ${FORK_VERSION}, including the \`rockchip\` collector.
+
+          Built from \`${GITHUB_REF_NAME}\` at commit \`${GITHUB_SHA}\`.
+
+          Distroless OCI image: \`${IMAGE}:${FORK_VERSION}-distroless\` (linux/amd64 + linux/arm64).
+          EOF
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "Release ${tag} already exists -- replacing assets"
+            gh release upload "${tag}" --clobber *.tar.gz sha256sums.txt
+            gh release edit "${tag}" --notes-file notes.md
+          else
+            gh release create "${tag}" \
+              --target "${GITHUB_SHA}" \
+              --title "node_exporter ${FORK_VERSION}" \
+              --notes-file notes.md \
+              *.tar.gz sha256sums.txt
+          fi
+          gh release view "${tag}"
