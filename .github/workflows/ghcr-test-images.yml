@@ -38,7 +38,7 @@ concurrency:
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/node_exporter
   # Explicit fork version -- bump this single value for each build
-  FORK_VERSION: 1.12.1-rpardini2
+  FORK_VERSION: 1.12.1-rpardini3
 
 jobs:
   build:
